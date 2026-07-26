@@ -138,51 +138,64 @@ def step2_align_images(ref_img, tgt_img, output_exr):
     cv2.imwrite(output_exr, cv2.cvtColor(final_aligned, cv2.COLOR_RGB2BGR))
     return final_aligned, valid_mask
 
-def step3_physically_correct_merge(aligned_images, exposure_times, output_exr):
+def step3_physically_correct_merge(aligned_images, exposure_times):
     """
     Step 3: Exposure weighted merge for true Scene-Referred HDR.
     Inputs are Linear Float32 RGB.
+    Returns absolute irradiance.
     """
     h, w, c = aligned_images[0].shape
     hdr_sum = np.zeros((h, w, c), dtype=np.float32)
     weight_sum = np.zeros((h, w, c), dtype=np.float32)
     
     for img, exp in zip(aligned_images, exposure_times):
-        # Weight based on linear values. Avoid values near 0 (noise) and near 1 (clipping)
-        # Assuming peak linear value around 1.0 (some highlights may exceed slightly due to XYZ conversion, but base raw is ~1.0 max)
         weight = 1.0 - np.abs(np.clip(img, 0.0, 1.0) - 0.5) * 2.0
         weight = np.clip(weight, 1e-6, 1.0)
-        
         irradiance = img / exp
         hdr_sum += irradiance * weight
         weight_sum += weight
         
     hdr_merged = hdr_sum / weight_sum
-    cv2.imwrite(output_exr, cv2.cvtColor(hdr_merged, cv2.COLOR_RGB2BGR))
     return hdr_merged
 
-def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
+def normalize_and_cap_hdr(hdr_absolute, percentile=95.0, max_gain=8.0):
     """
-    Step 4: Map Scene-referred HDR to SDR Display (ACES Filmic-like + sRGB gamma).
+    Normalize HDR absolute irradiance to 1.0 based on percentile, 
+    and cap max highlights.
     """
-    # Normalize HDR by a percentile to anchor the exposure
-    # Find the 90th percentile luminance to represent diffuse white
-    lum = 0.2126 * hdr_linear[:,:,0] + 0.7152 * hdr_linear[:,:,1] + 0.0722 * hdr_linear[:,:,2]
-    diffuse_white = np.percentile(lum, 90)
+    # Luminance for Rec.2020
+    lum = 0.2627 * hdr_absolute[:,:,0] + 0.6780 * hdr_absolute[:,:,1] + 0.0593 * hdr_absolute[:,:,2]
+    p_val = np.percentile(lum, percentile)
     
-    # Scale so diffuse white is mapped to ~0.18 (mid-gray) for ACES input
-    scaled = (hdr_linear / (diffuse_white + 1e-6)) * 0.18
+    hdr_norm = hdr_absolute / (p_val + 1e-6)
+    hdr_intent = np.clip(hdr_norm, 0.0, max_gain)
+    return hdr_intent
+
+def sdr_soft_knee_tonemap_luminance(hdr_intent, knee=0.8):
+    """
+    Step 4: Map HDR Intent to SDR using Luminance-Ratio Soft-Knee.
+    Preserves chromaticity (no color shift) and guarantees Gain=1.0 for darks/mids.
+    """
+    # 1. Luminance (Rec.2020)
+    Y = 0.2627 * hdr_intent[:,:,0] + 0.6780 * hdr_intent[:,:,1] + 0.0593 * hdr_intent[:,:,2]
     
-    # Narkowicz ACES fit (approximate for display)
-    def aces_tonemap(x):
-        a = 2.51
-        b = 0.03
-        c = 2.43
-        d = 0.59
-        e = 0.14
-        return np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+    # 2. Soft-Knee on Luminance ONLY
+    Y_sdr = np.copy(Y)
+    mask = Y > knee
+    Y_sdr[mask] = knee + (1.0 - knee) * (1.0 - np.exp(-(Y[mask] - knee) / (1.0 - knee)))
     
-    sdr_linear = aces_tonemap(scaled)
+    # 3. Ratio
+    ratio = Y_sdr / (Y + 1e-6)
+    
+    # 4. Apply to RGB
+    sdr_linear = hdr_intent * ratio[:, :, np.newaxis]
+    return sdr_linear
+
+def step4_sdr_generation(sdr_linear, output_jpg):
+    """
+    Convert SDR Linear Rec.2020 to sRGB Gamma JPEG.
+    """
+
     
     # Convert Linear Rec.2020 SDR back to Linear sRGB for standard JPEG
     illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D65']
@@ -241,7 +254,7 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
     if os.path.exists(tmp_raw_path):
         os.remove(tmp_raw_path)
 
-def process_folder(input_dir, output_dir):
+def process_folder(input_dir, output_dir, args):
     os.makedirs(output_dir, exist_ok=True)
     
     nef_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.nef')])
@@ -292,18 +305,23 @@ def process_folder(input_dir, output_dir):
     
     cropped_aligned = [img[rmin:rmax, cmin:cmax] for img in aligned_images]
     
-    out_hdr_exr = os.path.join(output_dir, "03_hdr_merged.exr")
-    print(f"Step 3: Physically Correct HDR Merge -> {out_hdr_exr}")
+    print("Step 3: Physically Correct HDR Merge (Absolute Irradiance)")
     exposure_times = [item['exp'] for item in file_info]
-    hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
+    hdr_absolute = step3_physically_correct_merge(cropped_aligned, exposure_times)
+    
+    out_hdr_exr = os.path.join(output_dir, "03_hdr_intent.exr")
+    print(f"Step 3b: Percentile Normalization (p={args.percentile}) & Capping (max={args.max_gain}) -> {out_hdr_exr}")
+    hdr_intent = normalize_and_cap_hdr(hdr_absolute, args.percentile, args.max_gain)
+    cv2.imwrite(out_hdr_exr, cv2.cvtColor(hdr_intent, cv2.COLOR_RGB2BGR))
     
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
-    print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
-    step4_hdr_to_sdr_tonemap(hdr_merged, out_sdr_jpg)
+    print(f"Step 4: SDR Tone Mapping (Luminance Soft-Knee) -> {out_sdr_jpg}")
+    sdr_linear = sdr_soft_knee_tonemap_luminance(hdr_intent, knee=0.8)
+    step4_sdr_generation(sdr_linear, out_sdr_jpg)
     
     out_ultrahdr = os.path.join(output_dir, "05_final_ultrahdr.jpg")
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr) -> {out_ultrahdr}")
-    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, out_ultrahdr)
+    step5_ultrahdr_encode(out_sdr_jpg, hdr_intent, out_ultrahdr)
     
     print("Done!")
 
@@ -311,6 +329,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Ultra HDR Pipeline (ISO 21496-1)")
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
     parser.add_argument("-o", "--output", default="Output", help="Output directory for intermediates and final image")
+    parser.add_argument("--percentile", type=float, default=95.0, help="Percentile for exposure normalization (e.g. 95)")
+    parser.add_argument("--max_gain", type=float, default=8.0, help="Maximum HDR gain restriction (e.g. 8.0)")
     args = parser.parse_args()
     
-    process_folder(args.input, args.output)
+    process_folder(args.input, args.output, args)
