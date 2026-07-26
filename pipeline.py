@@ -324,8 +324,11 @@ def process_folder(input_dir, output_dir, keep_intermediates=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Ultra HDR Pipeline (ISO 21496-1)")
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
-    parser.add_argument("-o", "--output", default="Output", help="Output directory for intermediates and final image")
+    parser.add_argument("-o", "--output", help="Output directory for intermediates and final image (Defaults to input directory)")
     parser.add_argument("--keep_intermediates", action="store_true", help="Keep intermediate EXR and JPG files for debugging")
     args = parser.parse_args()
     
+    if args.output is None:
+        args.output = args.input
+        
     process_folder(args.input, args.output, args.keep_intermediates)
