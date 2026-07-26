@@ -11,6 +11,7 @@ import re
 import struct
 import argparse
 import subprocess
+import glob
 import numpy as np
 import cv2
 import rawpy
@@ -241,7 +242,7 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
     if os.path.exists(tmp_raw_path):
         os.remove(tmp_raw_path)
 
-def process_folder(input_dir, output_dir):
+def process_folder(input_dir, output_dir, keep_intermediates=False):
     os.makedirs(output_dir, exist_ok=True)
     
     nef_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.nef')])
@@ -305,12 +306,26 @@ def process_folder(input_dir, output_dir):
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr) -> {out_ultrahdr}")
     step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, out_ultrahdr)
     
+    if not keep_intermediates:
+        print("Cleaning up intermediate files...")
+        for f in glob.glob(os.path.join(output_dir, "01_raw_linear_*.exr")):
+            if os.path.exists(f): os.remove(f)
+        for f in glob.glob(os.path.join(output_dir, "02_aligned_*.exr")):
+            if os.path.exists(f): os.remove(f)
+        if os.path.exists(out_hdr_exr):
+            os.remove(out_hdr_exr)
+        if os.path.exists(out_sdr_jpg):
+            os.remove(out_sdr_jpg)
+        if os.path.exists("tmp_hdr_intent.raw"):
+            os.remove("tmp_hdr_intent.raw")
+            
     print("Done!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Ultra HDR Pipeline (ISO 21496-1)")
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
     parser.add_argument("-o", "--output", default="Output", help="Output directory for intermediates and final image")
+    parser.add_argument("--keep_intermediates", action="store_true", help="Keep intermediate EXR and JPG files for debugging")
     args = parser.parse_args()
     
-    process_folder(args.input, args.output)
+    process_folder(args.input, args.output, args.keep_intermediates)
