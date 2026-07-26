@@ -162,17 +162,13 @@ def step3_physically_correct_merge(aligned_images, exposure_times, output_exr):
     cv2.imwrite(output_exr, cv2.cvtColor(hdr_merged, cv2.COLOR_RGB2BGR))
     return hdr_merged
 
-def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
+def step4_hdr_to_sdr_tonemap(hdr_linear, ref_exp, output_jpg):
     """
     Step 4: Map Scene-referred HDR to SDR Display (ACES Filmic-like + sRGB gamma).
     """
-    # Normalize HDR by a percentile to anchor the exposure
-    # Find the 90th percentile luminance to represent diffuse white
-    lum = 0.2126 * hdr_linear[:,:,0] + 0.7152 * hdr_linear[:,:,1] + 0.0722 * hdr_linear[:,:,2]
-    diffuse_white = np.percentile(lum, 90)
-    
-    # Scale so diffuse white is mapped to ~0.18 (mid-gray) for ACES input
-    scaled = (hdr_linear / (diffuse_white + 1e-6)) * 0.18
+    # Physics-based Scene-Referred Exposure Anchoring
+    # Scale based on the 0EV physical exposure time, mapping it robustly for ACES
+    scaled = hdr_linear * ref_exp
     
     # Narkowicz ACES fit (approximate for display)
     def aces_tonemap(x):
@@ -206,7 +202,7 @@ def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
     cv2.imwrite(output_jpg, cv2.cvtColor(sdr_8bit, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     return sdr_8bit
 
-def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
+def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, ref_exp, output_ultrahdr, hdr_boost=4.0):
     """
     Step 5: Call Google libultrahdr (ultrahdr_app)
     Requires generating a temporary raw RGBA Half-Float binary for HDR intent.
@@ -216,7 +212,10 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
     # Convert HDR Linear Rec.2020 to RGBA Half Float (float16)
     # Alpha channel must be 1.0
     hdr_rgba = np.ones((h, w, 4), dtype=np.float16)
-    hdr_rgba[:, :, :3] = hdr_linear.astype(np.float16)
+    
+    # 基準露出に対してHDR側を意図的にブーストし、画面全体の発光感を高める
+    hdr_anchored = hdr_linear * ref_exp * hdr_boost
+    hdr_rgba[:, :, :3] = hdr_anchored.astype(np.float16)
     
     tmp_raw_path = "tmp_hdr_intent.raw"
     hdr_rgba.tofile(tmp_raw_path)
@@ -242,7 +241,7 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
     if os.path.exists(tmp_raw_path):
         os.remove(tmp_raw_path)
 
-def process_folder(input_dir, output_dir, keep_intermediates=False):
+def process_folder(input_dir, output_dir, keep_intermediates=False, hdr_boost=4.0):
     os.makedirs(output_dir, exist_ok=True)
     
     nef_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.nef')])
@@ -298,13 +297,29 @@ def process_folder(input_dir, output_dir, keep_intermediates=False):
     exposure_times = [item['exp'] for item in file_info]
     hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
     
+    def print_hdr_statistics(hdr_image, ref_exp):
+        anchored = hdr_image * ref_exp
+        lum = 0.2126 * anchored[:,:,0] + 0.7152 * anchored[:,:,1] + 0.0722 * anchored[:,:,2]
+        print("\nHDR Statistics (0EV Anchored Luma)")
+        print("--------------")
+        print(f"Min:   {np.min(lum):.6f}")
+        print(f"Max:   {np.max(lum):.6f}")
+        print(f"Mean:  {np.mean(lum):.6f}")
+        print(f"Median:{np.median(lum):.6f}")
+        print(f"P90:   {np.percentile(lum, 90):.6f}")
+        print(f"P95:   {np.percentile(lum, 95):.6f}")
+        print(f"P99:   {np.percentile(lum, 99):.6f}")
+        print(f"P99.9: {np.percentile(lum, 99.9):.6f}\n")
+
+    print_hdr_statistics(hdr_merged, ref_item['exp'])
+    
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
     print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
-    step4_hdr_to_sdr_tonemap(hdr_merged, out_sdr_jpg)
+    step4_hdr_to_sdr_tonemap(hdr_merged, ref_item['exp'], out_sdr_jpg)
     
     out_ultrahdr = os.path.join(output_dir, "05_final_ultrahdr.jpg")
-    print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr) -> {out_ultrahdr}")
-    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, out_ultrahdr)
+    print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr, boost={hdr_boost}x) -> {out_ultrahdr}")
+    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_item['exp'], out_ultrahdr, hdr_boost)
     
     if not keep_intermediates:
         print("Cleaning up intermediate files...")
@@ -326,9 +341,10 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
     parser.add_argument("-o", "--output", help="Output directory for intermediates and final image (Defaults to input directory)")
     parser.add_argument("--keep_intermediates", action="store_true", help="Keep intermediate EXR and JPG files for debugging")
+    parser.add_argument("--hdr_boost", type=float, default=4.0, help="Overall brightness multiplier for the HDR intent (default: 4.0)")
     args = parser.parse_args()
     
     if args.output is None:
         args.output = args.input
         
-    process_folder(args.input, args.output, args.keep_intermediates)
+    process_folder(args.input, args.output, args.keep_intermediates, args.hdr_boost)
