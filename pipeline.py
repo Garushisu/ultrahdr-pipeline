@@ -72,20 +72,18 @@ def step1_raw_to_linear(nef_path, output_exr):
     linear_xyz_float = linear_xyz_16.astype(np.float32) / 65535.0
     
     # Convert XYZ to Linear Rec.2020 using colour-science
-    # Illuminant is D65 for Rec.2020
-    illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D65']
-    illuminant_RGB = colour.models.RGB_COLOURSPACE_BT2020.whitepoint
+    # rawpy XYZ output illuminant is usually D50
+    illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D50']
     
     linear_rec2020 = colour.XYZ_to_RGB(
         linear_xyz_float,
-        illuminant_XYZ,
-        illuminant_RGB,
-        colour.models.RGB_COLOURSPACE_BT2020.matrix_XYZ_to_RGB,
+        colour.models.RGB_COLOURSPACE_BT2020,
+        illuminant=illuminant_XYZ,
         chromatic_adaptation_transform='CAT02'
     )
     
     # Clip negative values that can result from matrix conversion, but keep highlights
-    linear_rec2020 = np.maximum(linear_rec2020, 0.0)
+    linear_rec2020 = np.maximum(linear_rec2020, 0.0).astype(np.float32)
     
     # Save as EXR (BGR order required for OpenCV)
     cv2.imwrite(output_exr, cv2.cvtColor(linear_rec2020, cv2.COLOR_RGB2BGR))
@@ -124,7 +122,7 @@ def step2_align_images(ref_img, tgt_img, output_exr):
     warped_stage1 = cv2.warpPerspective(tgt_img, H, (w, h), flags=cv2.INTER_LANCZOS4)
 
     try:
-        warped_gray = cv2.cvtColor(np.clip(np.power(warped_stage1, 1/2.2) * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        warped_gray = cv2.cvtColor(np.clip(np.power(np.clip(warped_stage1, 0, None), 1/2.2) * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
         warp_matrix = np.eye(2, 3, dtype=np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5)
         _, warp_matrix = cv2.findTransformECC(ref_gray, warped_gray, warp_matrix, cv2.MOTION_TRANSLATION, criteria)
@@ -193,7 +191,7 @@ def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
         colour.models.RGB_COLOURSPACE_BT2020,
         colour.models.RGB_COLOURSPACE_sRGB,
         chromatic_adaptation_transform='CAT02'
-    )
+    ).astype(np.float32)
     sdr_linear_srgb = np.clip(sdr_linear_srgb, 0.0, 1.0)
     
     # Apply sRGB Gamma Transfer Function
