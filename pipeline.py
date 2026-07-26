@@ -161,30 +161,31 @@ def step3_physically_correct_merge(aligned_images, exposure_times, output_exr):
     cv2.imwrite(output_exr, cv2.cvtColor(hdr_merged, cv2.COLOR_RGB2BGR))
     return hdr_merged
 
-def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
+def step4_sdr_soft_knee_tonemap(hdr_linear, ref_exp, output_jpg):
     """
-    Step 4: Map Scene-referred HDR to SDR Display (ACES Filmic-like + sRGB gamma).
+    Step 4: Map Scene-referred HDR to SDR Display using Luminance-Ratio Soft-Knee.
+    0 to midtones match HDR exactly (Gain=1.0). Highlights are compressed.
     """
-    # Normalize HDR by a percentile to anchor the exposure
-    # Find the 90th percentile luminance to represent diffuse white
-    lum = 0.2126 * hdr_linear[:,:,0] + 0.7152 * hdr_linear[:,:,1] + 0.0722 * hdr_linear[:,:,2]
-    diffuse_white = np.percentile(lum, 90)
+    # Anchor absolute irradiance to 0-1 relative linear space
+    hdr_anchored = hdr_linear * ref_exp
     
-    # Scale so diffuse white is mapped to ~0.18 (mid-gray) for ACES input
-    scaled = (hdr_linear / (diffuse_white + 1e-6)) * 0.18
+    # 1. Luminance (Rec.2020)
+    Y = 0.2627 * hdr_anchored[:,:,0] + 0.6780 * hdr_anchored[:,:,1] + 0.0593 * hdr_anchored[:,:,2]
     
-    # Narkowicz ACES fit (approximate for display)
-    def aces_tonemap(x):
-        a = 2.51
-        b = 0.03
-        c = 2.43
-        d = 0.59
-        e = 0.14
-        return np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+    # 2. Soft-Knee on Luminance
+    knee = 0.8
+    Y_sdr = np.copy(Y)
+    mask = Y > knee
+    # Soft knee asymptotic to 1.0
+    Y_sdr[mask] = knee + (1.0 - knee) * (1.0 - np.exp(-(Y[mask] - knee) / (1.0 - knee)))
     
-    sdr_linear = aces_tonemap(scaled)
+    # 3. Ratio
+    ratio = Y_sdr / (Y + 1e-6)
     
-    # Convert Linear Rec.2020 SDR back to Linear sRGB for standard JPEG
+    # 4. Apply to RGB (preserves chromaticity)
+    sdr_linear = hdr_anchored * ratio[:, :, np.newaxis]
+    
+    # Convert Linear Rec.2020 SDR to Linear sRGB for standard JPEG
     illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D65']
     sdr_linear_srgb = colour.RGB_to_RGB(
         sdr_linear,
@@ -205,17 +206,20 @@ def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
     cv2.imwrite(output_jpg, cv2.cvtColor(sdr_8bit, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     return sdr_8bit
 
-def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
+def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, ref_exp, output_ultrahdr):
     """
     Step 5: Call Google libultrahdr (ultrahdr_app)
     Requires generating a temporary raw RGBA Half-Float binary for HDR intent.
+    We anchor the absolute irradiance to relative 0-1 for Gain Map calculation so midtones have Gain=1.0.
     """
     h, w, c = hdr_linear.shape
+    
+    hdr_anchored = hdr_linear * ref_exp
     
     # Convert HDR Linear Rec.2020 to RGBA Half Float (float16)
     # Alpha channel must be 1.0
     hdr_rgba = np.ones((h, w, 4), dtype=np.float16)
-    hdr_rgba[:, :, :3] = hdr_linear.astype(np.float16)
+    hdr_rgba[:, :, :3] = hdr_anchored.astype(np.float16)
     
     tmp_raw_path = "tmp_hdr_intent.raw"
     hdr_rgba.tofile(tmp_raw_path)
@@ -297,13 +301,14 @@ def process_folder(input_dir, output_dir):
     exposure_times = [item['exp'] for item in file_info]
     hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
     
+    ref_exp = file_info[ref_idx]['exp']
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
-    print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
-    step4_hdr_to_sdr_tonemap(hdr_merged, out_sdr_jpg)
+    print(f"Step 4: SDR Tone Mapping (Soft-Knee) -> {out_sdr_jpg}")
+    step4_sdr_soft_knee_tonemap(hdr_merged, ref_exp, out_sdr_jpg)
     
     out_ultrahdr = os.path.join(output_dir, "05_final_ultrahdr.jpg")
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr) -> {out_ultrahdr}")
-    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, out_ultrahdr)
+    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_exp, out_ultrahdr)
     
     print("Done!")
 
