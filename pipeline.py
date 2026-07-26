@@ -19,6 +19,20 @@ import colour
 # Ensure OpenCV can read/write EXR
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+def print_hdr_statistics(hdr_linear, name="HDR Statistics"):
+    """Print luminance statistics of the HDR image."""
+    lum = 0.2126 * hdr_linear[:,:,0] + 0.7152 * hdr_linear[:,:,1] + 0.0722 * hdr_linear[:,:,2]
+    print(f"\n{name}")
+    print("-" * 14)
+    print(f"Min:   {np.min(lum):.6f}")
+    print(f"Max:   {np.max(lum):.6f}")
+    print(f"Mean:  {np.mean(lum):.6f}")
+    print(f"Median:{np.median(lum):.6f}")
+    print(f"P90:   {np.percentile(lum, 90):.6f}")
+    print(f"P95:   {np.percentile(lum, 95):.6f}")
+    print(f"P99:   {np.percentile(lum, 99):.6f}")
+    print(f"P99.9: {np.percentile(lum, 99.9):.6f}\n")
+
 def get_exif_data(filepath):
     """Extract exposure bias and exposure time (shutter speed) from NEF EXIF header."""
     try:
@@ -302,6 +316,9 @@ def process_folder(input_dir, output_dir):
     hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
     
     ref_exp = file_info[ref_idx]['exp']
+    hdr_anchored = hdr_merged * ref_exp
+    print_hdr_statistics(hdr_anchored, name="HDR Statistics (0EV Anchored Luma)")
+    
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
     print(f"Step 4: ACES Tone Mapping (Anchored 0EV) -> {out_sdr_jpg}")
     step4_hdr_to_sdr_tonemap_aces(hdr_merged, ref_exp, args.ev_comp, out_sdr_jpg)
