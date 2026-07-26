@@ -158,16 +158,19 @@ def step3_physically_correct_merge(aligned_images, exposure_times):
     hdr_merged = hdr_sum / weight_sum
     return hdr_merged
 
-def normalize_and_cap_hdr(hdr_absolute, percentile=95.0, max_gain=8.0):
+def normalize_and_cap_hdr(hdr_absolute, ref_exp, ev_comp=0.0, max_gain=8.0):
     """
-    Normalize HDR absolute irradiance to 1.0 based on percentile, 
-    and cap max highlights.
+    Normalize HDR absolute irradiance based on 0EV reference exposure,
+    apply optional EV compensation, and cap max highlights.
     """
-    # Luminance for Rec.2020
-    lum = 0.2627 * hdr_absolute[:,:,0] + 0.6780 * hdr_absolute[:,:,1] + 0.0593 * hdr_absolute[:,:,2]
-    p_val = np.percentile(lum, percentile)
+    # 1. 0EV基準の相対輝度に戻す
+    hdr_norm = hdr_absolute * ref_exp
     
-    hdr_norm = hdr_absolute / (p_val + 1e-6)
+    # 2. 任意の露出補正（EV）を適用
+    linear_comp = 2.0 ** ev_comp
+    hdr_norm = hdr_norm * linear_comp
+    
+    # 3. 最大ゲインのクリッピング
     hdr_intent = np.clip(hdr_norm, 0.0, max_gain)
     return hdr_intent
 
@@ -310,8 +313,9 @@ def process_folder(input_dir, output_dir, args):
     hdr_absolute = step3_physically_correct_merge(cropped_aligned, exposure_times)
     
     out_hdr_exr = os.path.join(output_dir, "03_hdr_intent.exr")
-    print(f"Step 3b: Percentile Normalization (p={args.percentile}) & Capping (max={args.max_gain}) -> {out_hdr_exr}")
-    hdr_intent = normalize_and_cap_hdr(hdr_absolute, args.percentile, args.max_gain)
+    print(f"Step 3b: 0EV Anchoring (EV Comp={args.ev_comp}) & Capping (max={args.max_gain}) -> {out_hdr_exr}")
+    ref_exp = file_info[ref_idx]['exp']
+    hdr_intent = normalize_and_cap_hdr(hdr_absolute, ref_exp, args.ev_comp, args.max_gain)
     cv2.imwrite(out_hdr_exr, cv2.cvtColor(hdr_intent, cv2.COLOR_RGB2BGR))
     
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
@@ -329,7 +333,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Ultra HDR Pipeline (ISO 21496-1)")
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
     parser.add_argument("-o", "--output", default="Output", help="Output directory for intermediates and final image")
-    parser.add_argument("--percentile", type=float, default=95.0, help="Percentile for exposure normalization (e.g. 95)")
+    parser.add_argument("--ev_comp", type=float, default=1.0, help="Exposure compensation in EV (e.g. 1.0 for +1EV brightness)")
     parser.add_argument("--max_gain", type=float, default=8.0, help="Maximum HDR gain restriction (e.g. 8.0)")
     args = parser.parse_args()
     
