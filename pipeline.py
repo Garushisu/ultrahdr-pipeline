@@ -161,17 +161,18 @@ def step3_physically_correct_merge(aligned_images, exposure_times, output_exr):
     cv2.imwrite(output_exr, cv2.cvtColor(hdr_merged, cv2.COLOR_RGB2BGR))
     return hdr_merged
 
-def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
+def step4_hdr_to_sdr_tonemap_aces(hdr_linear, ref_exp, ev_comp, output_jpg):
     """
     Step 4: Map Scene-referred HDR to SDR Display (ACES Filmic-like + sRGB gamma).
+    Uses 0EV exposure anchoring to properly expose the ACES tonemapper.
     """
-    # Normalize HDR by a percentile to anchor the exposure
-    # Find the 90th percentile luminance to represent diffuse white
-    lum = 0.2126 * hdr_linear[:,:,0] + 0.7152 * hdr_linear[:,:,1] + 0.0722 * hdr_linear[:,:,2]
-    diffuse_white = np.percentile(lum, 90)
+    # Anchor absolute irradiance back to 0-1 relative space
+    hdr_anchored = hdr_linear * ref_exp
     
-    # Scale so diffuse white is mapped to ~0.18 (mid-gray) for ACES input
-    scaled = (hdr_linear / (diffuse_white + 1e-6)) * 0.18
+    # Apply user-defined exposure compensation (linear scale)
+    # ACES expects mid-gray at ~0.18. Camera 0EV often places mid-gray near 0.18.
+    linear_comp = 2.0 ** ev_comp
+    scaled = hdr_anchored * linear_comp
     
     # Narkowicz ACES fit (approximate for display)
     def aces_tonemap(x):
@@ -205,17 +206,20 @@ def step4_hdr_to_sdr_tonemap(hdr_linear, output_jpg):
     cv2.imwrite(output_jpg, cv2.cvtColor(sdr_8bit, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     return sdr_8bit
 
-def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, output_ultrahdr):
+def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, ref_exp, output_ultrahdr):
     """
     Step 5: Call Google libultrahdr (ultrahdr_app)
     Requires generating a temporary raw RGBA Half-Float binary for HDR intent.
+    We anchor the absolute irradiance to relative 0-1 for Gain Map calculation.
     """
     h, w, c = hdr_linear.shape
+    
+    hdr_anchored = hdr_linear * ref_exp
     
     # Convert HDR Linear Rec.2020 to RGBA Half Float (float16)
     # Alpha channel must be 1.0
     hdr_rgba = np.ones((h, w, 4), dtype=np.float16)
-    hdr_rgba[:, :, :3] = hdr_linear.astype(np.float16)
+    hdr_rgba[:, :, :3] = hdr_anchored.astype(np.float16)
     
     tmp_raw_path = "tmp_hdr_intent.raw"
     hdr_rgba.tofile(tmp_raw_path)
@@ -297,13 +301,14 @@ def process_folder(input_dir, output_dir):
     exposure_times = [item['exp'] for item in file_info]
     hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
     
+    ref_exp = file_info[ref_idx]['exp']
     out_sdr_jpg = os.path.join(output_dir, "04_sdr_tonemapped.jpg")
-    print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
-    step4_hdr_to_sdr_tonemap(hdr_merged, out_sdr_jpg)
+    print(f"Step 4: ACES Tone Mapping (Anchored 0EV) -> {out_sdr_jpg}")
+    step4_hdr_to_sdr_tonemap_aces(hdr_merged, ref_exp, args.ev_comp, out_sdr_jpg)
     
     out_ultrahdr = os.path.join(output_dir, "05_final_ultrahdr.jpg")
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr) -> {out_ultrahdr}")
-    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, out_ultrahdr)
+    step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_exp, out_ultrahdr)
     
     print("Done!")
 
@@ -311,6 +316,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Google Ultra HDR Pipeline (ISO 21496-1)")
     parser.add_argument("-i", "--input", required=True, help="Input directory containing NEF files")
     parser.add_argument("-o", "--output", default="Output", help="Output directory for intermediates and final image")
+    parser.add_argument("--ev_comp", type=float, default=1.0, help="Exposure compensation in EV (e.g. 1.0 for +1EV brightness)")
     args = parser.parse_args()
     
     process_folder(args.input, args.output)
