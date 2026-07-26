@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+Output/
+*.exr
+*.jpg
+*.tif
+*.raw
+*.yuv
+.DS_Store
