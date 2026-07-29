@@ -33,7 +33,10 @@ Our V4 architecture features **0EV Physical Anchoring**, guaranteeing mathematic
    git clone https://github.com/google/libultrahdr.git
    cd libultrahdr
    mkdir build && cd build
-   cmake ..
+   cmake .. \
+     -DUHDR_BUILD_EXAMPLES=ON \
+     -DUHDR_WRITE_ISO=ON \
+     -DUHDR_WRITE_XMP=ON
    make -j4
    ```
 2. **Install Python Dependencies**:
