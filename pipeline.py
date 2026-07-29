@@ -220,7 +220,7 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, ref_exp, output_ultrahdr, hd
     tmp_raw_path = "tmp_hdr_intent.raw"
     hdr_rgba.tofile(tmp_raw_path)
     
-    ultrahdr_app_path = os.path.join(os.path.dirname(__file__), "libultrahdr", "build", "ultrahdr_app")
+    ultrahdr_app_path = os.path.join(os.path.dirname(__file__), "libultrahdr", "build-instagram", "ultrahdr_app")
     
     cmd = [
         ultrahdr_app_path,
@@ -232,7 +232,10 @@ def step5_ultrahdr_encode(sdr_jpg_path, hdr_linear, ref_exp, output_ultrahdr, hd
         "-a", "4",                          # rgbaHalfFloat
         "-C", "2",                          # bt2100 (Rec.2020) gamut
         "-t", "0",                          # Linear transfer function
-        "-z", output_ultrahdr
+        "-z", output_ultrahdr,
+        "-M", "0", # 単一チャンネルのゲインマップ
+        "-K", "8.0", # 最大HDRブーストを8倍（3EV）に制限
+        "-L", "1624", # SDR白203nit × 8 = HDRピーク約1624nit
     ]
     
     print("Running libultrahdr:", " ".join(cmd))
