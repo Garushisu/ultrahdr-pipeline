@@ -3,8 +3,9 @@
 NEF to Google Ultra HDR Pipeline (ISO 21496-1)
 ================================================
 Preserves RAW scene-referred linear data, performs high-precision alignment,
-true linear exposure merge, Auto-Exposure ACES tone mapping with Soft-Knee HDR roll-off,
-and Ultra HDR generation via Google libultrahdr.
+true linear exposure merge with Highlight Clipping Suppression,
+Auto-Exposure ACES tone mapping with Soft-Knee HDR roll-off,
+interactive EXIF selection, robust EXIF preservation via piexif, and Ultra HDR generation via Google libultrahdr.
 
 Author: DeepMind / Antigravity Agent
 """
@@ -21,6 +22,7 @@ import numpy as np
 import cv2
 import rawpy
 import colour
+import piexif
 
 # Enable OpenEXR support in OpenCV
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -31,6 +33,7 @@ TARGET_MIDTONE_LUMA: float = 0.18
 MAX_DISPLAY_BOOST: float = 8.0
 TARGET_PEAK_NITS: int = 1624
 JPEG_QUALITY: int = 95
+CLIPPING_SUPPRESSION_THRESHOLD: float = 0.85
 
 
 def extract_exif_exposure(filepath: str) -> Tuple[float, float]:
@@ -82,13 +85,144 @@ def extract_exif_exposure(filepath: str) -> Tuple[float, float]:
     return 0.0, 0.01
 
 
+def extract_valid_exif_bytes(nef_path: str) -> Optional[bytes]:
+    """
+    Extracts and validates EXIF payload from a RAW (NEF) file using piexif.
+    Returns b'Exif\\x00\\x00' + exif_bytes if valid EXIF exists, or None if missing or corrupted.
+    
+    :param nef_path: Path to RAW file.
+    :return: EXIF APP1 payload bytes or None.
+    """
+    try:
+        if not os.path.exists(nef_path):
+            return None
+        exif_dict = piexif.load(nef_path)
+        
+        if not exif_dict.get("0th") and not exif_dict.get("Exif"):
+            return None
+            
+        exif_dict["1st"] = {}
+        exif_dict["thumbnail"] = None
+        if piexif.ExifIFD.MakerNote in exif_dict.get("Exif", {}):
+            del exif_dict["Exif"][piexif.ExifIFD.MakerNote]
+            
+        exif_bytes = piexif.dump(exif_dict)
+        if 0 < len(exif_bytes) <= 65520:
+            return b'Exif\x00\x00' + exif_bytes
+    except Exception as e:
+        print(f"  [EXIF Check] Note: Unable to parse EXIF from {os.path.basename(nef_path)} ({e})")
+    return None
+
+
+def inject_exif_into_jpeg(jpg_path: str, exif_payload: bytes) -> bool:
+    """
+    Injects EXIF APP1 payload into destination JPEG file right after the SOI marker.
+    
+    :param jpg_path: Path to JPEG file.
+    :param exif_payload: Full EXIF payload (including 'Exif\\x00\\x00' header).
+    :return: True if successfully injected, False otherwise.
+    """
+    try:
+        with open(jpg_path, "rb") as f:
+            data = f.read()
+        if data[:2] != b'\xff\xd8':
+            return False
+
+        exif_len = len(exif_payload) + 2
+        app1_segment = b'\xff\xe1' + struct.pack('>H', exif_len) + exif_payload
+
+        new_jpeg = b'\xff\xd8' + app1_segment + data[2:]
+        with open(jpg_path, "wb") as f:
+            f.write(new_jpeg)
+        return True
+    except Exception as e:
+        print(f"  [EXIF Warning] Failed to inject EXIF to {os.path.basename(jpg_path)}: {e}")
+        return False
+
+
+def prompt_select_exif_source(nef_files: List[str], folder_name: str, specified_src: Optional[str] = None) -> Optional[str]:
+    """
+    Selects EXIF reference file.
+    1. If specified_src is provided, uses specified_src.
+    2. Auto-detects matching filename (folder_name + '.NEF').
+    3. Prompts user interactively using Arrow keys (UP/DOWN) and ENTER if TTY is available.
+    """
+    if not nef_files:
+        return None
+        
+    if specified_src:
+        if specified_src in nef_files:
+            return specified_src
+        print(f"  [EXIF Warning] Specified file '{specified_src}' not found in folder. Falling back to selection.")
+
+    default_filename = f"{folder_name}.NEF"
+    default_idx = 0
+    for idx, f in enumerate(nef_files):
+        if f.lower() == default_filename.lower():
+            default_idx = idx
+            break
+
+    if not sys.stdin.isatty():
+        selected = nef_files[default_idx]
+        print(f"  [EXIF] Non-interactive mode: Auto-selected EXIF source: {selected}")
+        return selected
+
+    import tty
+    import termios
+
+    print("\n" + "=" * 65)
+    print("  📷 Select EXIF Metadata Reference Source File")
+    print("  (Use UP / DOWN Arrow Keys to navigate, ENTER to confirm)")
+    print("=" * 65)
+
+    current_idx = default_idx
+    num_files = len(nef_files)
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def draw_menu():
+        for i, fname in enumerate(nef_files):
+            is_def = " (Folder match / Default)" if fname.lower() == default_filename.lower() else ""
+            if i == current_idx:
+                sys.stdout.write(f"\033[1;36m  ➔ [x] {fname}{is_def}\033[0m\n")
+            else:
+                sys.stdout.write(f"    [ ] {fname}{is_def}\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        draw_menu()
+
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[':
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == 'A':
+                        current_idx = (current_idx - 1) % num_files
+                    elif ch3 == 'B':
+                        current_idx = (current_idx + 1) % num_files
+            elif ch in ('\r', '\n'):
+                break
+            elif ch == '\x03':
+                raise KeyboardInterrupt
+
+            sys.stdout.write(f"\033[{num_files}A")
+            draw_menu()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        print()
+
+    selected = nef_files[current_idx]
+    print(f"  Selected EXIF Reference: {selected}\n")
+    return selected
+
+
 def step1_raw_to_linear(nef_path: str, output_exr: str) -> np.ndarray:
     """
     Step 1: Convert NEF RAW to Scene-Referred Linear Rec.2020 (32-bit float).
-    
-    :param nef_path: Path to input NEF file.
-    :param output_exr: Output path for temporary EXR image.
-    :return: Linear Rec.2020 Float32 image array (H, W, 3).
     """
     with rawpy.imread(nef_path) as raw:
         linear_xyz_16 = raw.postprocess(
@@ -117,11 +251,6 @@ def step1_raw_to_linear(nef_path: str, output_exr: str) -> np.ndarray:
 def step2_align_images(ref_img: np.ndarray, tgt_img: np.ndarray, output_exr: str) -> Tuple[np.ndarray, np.ndarray]:
     """
     Step 2: Align target image to reference image using SIFT + ECC in Linear Space.
-    
-    :param ref_img: Reference Float32 RGB image.
-    :param tgt_img: Target Float32 RGB image to align.
-    :param output_exr: Output EXR path for aligned result.
-    :return: Tuple of (aligned_image, valid_mask).
     """
     h, w = ref_img.shape[:2]
     
@@ -169,6 +298,7 @@ def step2_align_images(ref_img: np.ndarray, tgt_img: np.ndarray, output_exr: str
 def step3_physically_correct_merge(aligned_images: List[np.ndarray], exposure_times: List[float], output_exr: str) -> np.ndarray:
     """
     Step 3: Exposure-weighted merge for true Scene-Referred HDR.
+    Suppresses overexposed/clipped highlight pixels (>0.85) to prevent washout and preserve rich color.
     
     :param aligned_images: List of aligned Float32 RGB images.
     :param exposure_times: List of exposure times in seconds.
@@ -179,13 +309,26 @@ def step3_physically_correct_merge(aligned_images: List[np.ndarray], exposure_ti
     hdr_sum = np.zeros((h, w, c), dtype=np.float32)
     weight_sum = np.zeros((h, w, c), dtype=np.float32)
     
+    clip_threshold = CLIPPING_SUPPRESSION_THRESHOLD
+    
     for img, exp in zip(aligned_images, exposure_times):
-        weight = 1.0 - np.abs(np.clip(img, 0.0, 1.0) - 0.5) * 2.0
-        weight = np.clip(weight, 1e-6, 1.0)
+        # Gaussian weighting centered at 0.4 for smooth SNR transition
+        weight_base = np.exp(-np.square(img - 0.4) / (2.0 * (0.25 ** 2)))
+        
+        # Highlight Clipping Suppression Mask
+        max_c = np.max(img, axis=2, keepdims=True)
+        suppression = np.where(
+            max_c > clip_threshold,
+            np.square(np.clip((1.0 - max_c) / (1.0 - clip_threshold), 0.0, 1.0)),
+            1.0
+        )
+        
+        final_weight = weight_base * suppression
+        final_weight = np.clip(final_weight, 1e-7, 1.0)
         
         irradiance = img / exp
-        hdr_sum += irradiance * weight
-        weight_sum += weight
+        hdr_sum += irradiance * final_weight
+        weight_sum += final_weight
         
     hdr_merged = hdr_sum / weight_sum
     cv2.imwrite(output_exr, cv2.cvtColor(hdr_merged, cv2.COLOR_RGB2BGR))
@@ -196,11 +339,6 @@ def step4_hdr_to_sdr_tonemap(hdr_linear: np.ndarray, ref_exp: float, output_jpg:
     """
     Step 4: Map Scene-referred HDR to SDR Display (Auto-Exposure ACES Filmic + sRGB gamma).
     Ensures SDR base image has vibrant, proper midtone brightness (18% gray mapped near 128 in 8-bit).
-    
-    :param hdr_linear: Merged HDR Float32 image.
-    :param ref_exp: Reference exposure time in seconds.
-    :param output_jpg: Output path for base SDR JPEG.
-    :return: Tuple of (sdr_8bit_image, auto_exposure_gain).
     """
     scaled = hdr_linear * ref_exp
     luma = 0.2126 * scaled[:, :, 0] + 0.7152 * scaled[:, :, 1] + 0.0722 * scaled[:, :, 2]
@@ -247,10 +385,6 @@ def apply_hdr_highlight_rolloff(hdr_linear_anchored: np.ndarray, max_boost: floa
     """
     Applies a smooth soft-knee compression curve to the HDR intent signal.
     Prevents hard clipping above 70% of max display boost (e.g. 5.6x up to 8.0x max).
-    
-    :param hdr_linear_anchored: Uncompressed HDR intent array.
-    :param max_boost: Maximum allowed display boost multiplier.
-    :return: Compressed HDR intent array.
     """
     knee = max_boost * 0.70
     delta = max_boost - knee
@@ -266,13 +400,6 @@ def apply_hdr_highlight_rolloff(hdr_linear_anchored: np.ndarray, max_boost: floa
 def step5_ultrahdr_encode(sdr_jpg_path: str, hdr_linear: np.ndarray, ref_exp: float, auto_gain: float, output_ultrahdr: str, hdr_boost: float = DEFAULT_HDR_BOOST) -> None:
     """
     Step 5: Call Google libultrahdr (ultrahdr_app) to generate ISO 21496-1 Ultra HDR JPEG.
-    
-    :param sdr_jpg_path: Path to base SDR JPEG.
-    :param hdr_linear: Merged HDR Float32 image.
-    :param ref_exp: Reference exposure time in seconds.
-    :param auto_gain: Auto-exposure gain calculated in step 4.
-    :param output_ultrahdr: Destination path for Ultra HDR JPEG.
-    :param hdr_boost: HDR intent boost factor.
     """
     h, w, _ = hdr_linear.shape
     hdr_rgba = np.ones((h, w, 4), dtype=np.float16)
@@ -309,17 +436,20 @@ def step5_ultrahdr_encode(sdr_jpg_path: str, hdr_linear: np.ndarray, ref_exp: fl
             os.remove(tmp_raw_path)
 
 
-def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = False, hdr_boost: float = DEFAULT_HDR_BOOST) -> None:
+def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = False, hdr_boost: float = DEFAULT_HDR_BOOST, exif_src_file: Optional[str] = None) -> None:
     """
     Process input folder containing NEF RAW exposure stack into Ultra HDR JPEG.
     """
     os.makedirs(output_dir, exist_ok=True)
+    folder_name = os.path.basename(os.path.normpath(input_dir))
     
     nef_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.nef')])
     if not nef_files:
         print("No NEF files found.")
         return
         
+    selected_exif_file = prompt_select_exif_source(nef_files, folder_name, specified_src=exif_src_file)
+
     file_info = []
     for f in nef_files:
         p = os.path.join(input_dir, f)
@@ -364,7 +494,7 @@ def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = F
     cropped_aligned = [img[rmin:rmax, cmin:cmax] for img in aligned_images]
     
     out_hdr_exr = os.path.join(output_dir, "03_hdr_merged.exr")
-    print(f"Step 3: Physically Correct HDR Merge -> {out_hdr_exr}")
+    print(f"Step 3: Physically Correct HDR Merge (with Clipping Suppression) -> {out_hdr_exr}")
     exposure_times = [item['exp'] for item in file_info]
     hdr_merged = step3_physically_correct_merge(cropped_aligned, exposure_times, out_hdr_exr)
     
@@ -392,6 +522,20 @@ def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = F
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr, boost={hdr_boost}x) -> {out_ultrahdr}")
     step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_item['exp'], auto_gain, out_ultrahdr, hdr_boost)
     
+    if selected_exif_file:
+        exif_src_path = os.path.join(input_dir, selected_exif_file)
+        exif_payload = extract_valid_exif_bytes(exif_src_path)
+        
+        if exif_payload is not None:
+            print(f"  [EXIF] Valid EXIF metadata detected ({selected_exif_file}). Injecting into Ultra HDR JPEG...")
+            inject_exif_into_jpeg(out_ultrahdr, exif_payload)
+            if keep_intermediates and os.path.exists(out_sdr_jpg):
+                inject_exif_into_jpeg(out_sdr_jpg, exif_payload)
+        else:
+            print(f"  [EXIF] EXIF metadata is missing or corrupted in {selected_exif_file}. Skipping EXIF injection.")
+    else:
+        print("  [EXIF] No EXIF reference file selected. Skipping EXIF injection.")
+
     if not keep_intermediates:
         print("Cleaning up intermediate files...")
         for f in glob.glob(os.path.join(output_dir, "01_raw_linear_*.exr")):
@@ -414,9 +558,10 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", help="Output directory for intermediates and final image (Defaults to input directory)")
     parser.add_argument("--keep_intermediates", action="store_true", help="Keep intermediate EXR and JPG files for debugging")
     parser.add_argument("--hdr_boost", type=float, default=DEFAULT_HDR_BOOST, help=f"Overall brightness multiplier for the HDR intent (default: {DEFAULT_HDR_BOOST})")
+    parser.add_argument("--exif_src", help="Specify filename inside input directory to use for EXIF metadata reference")
     args = parser.parse_args()
     
     if args.output is None:
         args.output = args.input
         
-    process_folder(args.input, args.output, args.keep_intermediates, args.hdr_boost)
+    process_folder(args.input, args.output, args.keep_intermediates, args.hdr_boost, args.exif_src)
