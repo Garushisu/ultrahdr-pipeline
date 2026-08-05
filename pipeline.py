@@ -516,7 +516,7 @@ def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = F
     print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
     _, auto_gain = step4_hdr_to_sdr_tonemap(hdr_merged, ref_item['exp'], out_sdr_jpg)
     
-    out_ultrahdr = os.path.join(output_dir, "05_final_ultrahdr.jpg")
+    out_ultrahdr = os.path.join(output_dir, f"{folder_name}-hdr.jpg")
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr, boost={hdr_boost}x) -> {out_ultrahdr}")
     step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_item['exp'], auto_gain, out_ultrahdr, hdr_boost)
     
