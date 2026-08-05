@@ -28,7 +28,7 @@ import piexif
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 # Pipeline Constants
-DEFAULT_HDR_BOOST: float = 4.0
+DEFAULT_HDR_BOOST: float = 3.0
 TARGET_MIDTONE_LUMA: float = 0.18
 MAX_DISPLAY_BOOST: float = 8.0
 TARGET_PEAK_NITS: int = 1624
@@ -222,30 +222,24 @@ def prompt_select_exif_source(nef_files: List[str], folder_name: str, specified_
 
 def step1_raw_to_linear(nef_path: str, output_exr: str) -> np.ndarray:
     """
-    Step 1: Convert NEF RAW to Scene-Referred Linear Rec.2020 (32-bit float).
+    Step 1: Convert NEF RAW to Scene-Referred Linear sRGB (32-bit float) preserving Camera WB & Warmth.
+    
+    :param nef_path: Path to input NEF file.
+    :param output_exr: Output path for temporary EXR image.
+    :return: Linear sRGB Float32 image array (H, W, 3).
     """
     with rawpy.imread(nef_path) as raw:
-        linear_xyz_16 = raw.postprocess(
+        linear_srgb_16 = raw.postprocess(
             gamma=(1, 1),
             no_auto_bright=True,
             output_bps=16,
             use_camera_wb=True,
-            output_color=rawpy.ColorSpace.XYZ
+            output_color=rawpy.ColorSpace.sRGB
         )
     
-    linear_xyz_float = linear_xyz_16.astype(np.float32) / 65535.0
-    illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D50']
-    
-    linear_rec2020 = colour.XYZ_to_RGB(
-        linear_xyz_float,
-        colour.models.RGB_COLOURSPACE_BT2020,
-        illuminant=illuminant_XYZ,
-        chromatic_adaptation_transform='CAT02'
-    )
-    
-    linear_rec2020 = np.maximum(linear_rec2020, 0.0).astype(np.float32)
-    cv2.imwrite(output_exr, cv2.cvtColor(linear_rec2020, cv2.COLOR_RGB2BGR))
-    return linear_rec2020
+    linear_srgb_float = np.maximum(linear_srgb_16.astype(np.float32) / 65535.0, 0.0)
+    cv2.imwrite(output_exr, cv2.cvtColor(linear_srgb_float, cv2.COLOR_RGB2BGR))
+    return linear_srgb_float
 
 
 def step2_align_images(ref_img: np.ndarray, tgt_img: np.ndarray, output_exr: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -337,13 +331,18 @@ def step3_physically_correct_merge(aligned_images: List[np.ndarray], exposure_ti
 
 def step4_hdr_to_sdr_tonemap(hdr_linear: np.ndarray, ref_exp: float, output_jpg: str) -> Tuple[np.ndarray, float]:
     """
-    Step 4: Map Scene-referred HDR to SDR Display (Auto-Exposure ACES Filmic + sRGB gamma).
-    Ensures SDR base image has vibrant, proper midtone brightness (18% gray mapped near 128 in 8-bit).
+    Step 4: Map Scene-referred HDR to SDR Display using Chroma/Hue-Preserving ACES Filmic + sRGB gamma.
+    Preserves exact camera white balance, rich reds, and natural color warmth from original RAW.
+    
+    :param hdr_linear: Merged HDR Float32 image.
+    :param ref_exp: Reference exposure time in seconds.
+    :param output_jpg: Output path for base SDR JPEG.
+    :return: Tuple of (sdr_8bit_image, auto_exposure_gain).
     """
     scaled = hdr_linear * ref_exp
-    luma = 0.2126 * scaled[:, :, 0] + 0.7152 * scaled[:, :, 1] + 0.0722 * scaled[:, :, 2]
+    luma_in = 0.2126 * scaled[:, :, 0] + 0.7152 * scaled[:, :, 1] + 0.0722 * scaled[:, :, 2]
     
-    current_midtone = float(np.median(luma))
+    current_midtone = float(np.median(luma_in))
     if current_midtone > 0:
         auto_gain = TARGET_MIDTONE_LUMA / current_midtone
     else:
@@ -352,7 +351,7 @@ def step4_hdr_to_sdr_tonemap(hdr_linear: np.ndarray, ref_exp: float, output_jpg:
     auto_gain = float(np.clip(auto_gain, 1.0, 32.0))
     print(f"  [Auto-Exposure] Midtone Luma: {current_midtone:.6f} -> Applying Gain: {auto_gain:.2f}x")
     
-    mapped_input = scaled * auto_gain
+    mapped_luma_in = luma_in * auto_gain
     
     def aces_tonemap(x: np.ndarray) -> np.ndarray:
         a = 2.51
@@ -362,19 +361,18 @@ def step4_hdr_to_sdr_tonemap(hdr_linear: np.ndarray, ref_exp: float, output_jpg:
         e = 0.14
         return np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
     
-    sdr_linear = aces_tonemap(mapped_input)
-    illuminant_XYZ = colour.CCS_ILLUMINANTS['CIE 1931 2 Degree Standard Observer']['D65']
-    sdr_linear_srgb = colour.RGB_to_RGB(
-        sdr_linear,
-        colour.models.RGB_COLOURSPACE_BT2020,
-        colour.models.RGB_COLOURSPACE_sRGB,
-        chromatic_adaptation_transform='CAT02'
-    ).astype(np.float32)
-    sdr_linear_srgb = np.clip(sdr_linear_srgb, 0.0, 1.0)
+    luma_out = aces_tonemap(mapped_luma_in)
     
-    sdr_gamma = np.where(sdr_linear_srgb <= 0.0031308,
-                         12.92 * sdr_linear_srgb,
-                         1.055 * np.power(sdr_linear_srgb, 1/2.4) - 0.055)
+    # Calculate Luminance scaling factor to preserve 100% of original RAW RGB ratios (Hue & Saturation)
+    denom = np.maximum(mapped_luma_in, 1e-6)
+    scale_factor = (luma_out / denom)[:, :, np.newaxis]
+    
+    sdr_linear = np.clip(scaled * auto_gain * scale_factor, 0.0, 1.0)
+    
+    # Apply sRGB Gamma Transfer Function
+    sdr_gamma = np.where(sdr_linear <= 0.0031308,
+                         12.92 * sdr_linear,
+                         1.055 * np.power(sdr_linear, 1/2.4) - 0.055)
                          
     sdr_8bit = np.clip(sdr_gamma * 255.0, 0, 255).astype(np.uint8)
     cv2.imwrite(output_jpg, cv2.cvtColor(sdr_8bit, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
@@ -408,7 +406,7 @@ def step5_ultrahdr_encode(sdr_jpg_path: str, hdr_linear: np.ndarray, ref_exp: fl
     hdr_anchored_rolloff = apply_hdr_highlight_rolloff(hdr_anchored, max_boost=MAX_DISPLAY_BOOST)
     hdr_rgba[:, :, :3] = hdr_anchored_rolloff.astype(np.float16)
     
-    tmp_raw_path = os.path.abspath("tmp_hdr_intent.raw")
+    tmp_raw_path = os.path.abspath(os.path.join(os.path.dirname(output_ultrahdr), "tmp_hdr_intent.raw"))
     try:
         hdr_rgba.tofile(tmp_raw_path)
         ultrahdr_app_path = os.path.join(os.path.dirname(__file__), "libultrahdr", "build-instagram", "ultrahdr_app")
