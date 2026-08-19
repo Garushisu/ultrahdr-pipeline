@@ -28,7 +28,7 @@ import piexif
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 # Pipeline Constants
-DEFAULT_HDR_BOOST: float = 3.0
+DEFAULT_HDR_BOOST: float = 2.0
 TARGET_MIDTONE_LUMA: float = 0.18
 MAX_DISPLAY_BOOST: float = 8.0
 TARGET_PEAK_NITS: int = 1624
@@ -439,7 +439,7 @@ def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = F
     Process input folder containing NEF RAW exposure stack into Ultra HDR JPEG.
     """
     os.makedirs(output_dir, exist_ok=True)
-    folder_name = os.path.basename(os.path.normpath(input_dir))
+    folder_name = os.path.basename(os.path.abspath(input_dir))
     
     nef_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.nef')])
     if not nef_files:
@@ -516,7 +516,7 @@ def process_folder(input_dir: str, output_dir: str, keep_intermediates: bool = F
     print(f"Step 4: ACES Tone Mapping (SDR Generation) -> {out_sdr_jpg}")
     _, auto_gain = step4_hdr_to_sdr_tonemap(hdr_merged, ref_item['exp'], out_sdr_jpg)
     
-    out_ultrahdr = os.path.join(output_dir, f"{folder_name}-hdr.jpg")
+    out_ultrahdr = os.path.join(output_dir, f"{folder_name}-hdr-boost-{hdr_boost}.jpg")
     print(f"Step 5: Ultra HDR JPEG Generation (libultrahdr, boost={hdr_boost}x) -> {out_ultrahdr}")
     step5_ultrahdr_encode(out_sdr_jpg, hdr_merged, ref_item['exp'], auto_gain, out_ultrahdr, hdr_boost)
     
